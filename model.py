@@ -1,47 +1,66 @@
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class CRNN(nn.Module):
-    def __init__(self, cnn_output_height, gru_hidden_size, gru_num_layers, num_classes):
-        super(CRNN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=(3, 3))
-        self.norm1 = nn.InstanceNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=(3, 3), stride=2)
-        self.norm2 = nn.InstanceNorm2d(32)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=(3, 3))
-        self.norm3 = nn.InstanceNorm2d(64)
-        self.conv4 = nn.Conv2d(64, 64, kernel_size=(3, 3), stride=2)
-        self.norm4 = nn.InstanceNorm2d(64)
-        self.gru_input_size = cnn_output_height * 64
-        self.gru = nn.GRU(
-            self.gru_input_size,
-            gru_hidden_size,
-            gru_num_layers,
-            batch_first=True,
-            bidirectional=True,
-        )
-        self.fc = nn.Linear(gru_hidden_size * 2, num_classes)
 
-    def forward(self, x):
-        batch_size = x.shape[0]
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = F.leaky_relu(out)
-        out = self.conv2(out)
-        out = self.norm2(out)
-        out = F.leaky_relu(out)
-        out = self.conv3(out)
-        out = self.norm3(out)
-        out = F.leaky_relu(out)
-        out = self.conv4(out)
-        out = self.norm4(out)
-        out = F.leaky_relu(out)
-        out = out.permute(0, 3, 2, 1)
-        out = out.reshape(batch_size, -1, self.gru_input_size)
-        out, _ = self.gru(out)
-        out = torch.stack(
-            [F.log_softmax(self.fc(out[i]), dim=-1) for i in range(out.shape[0])]
-        )
-        return out
+    def __init__(self,
+                 img_channel, img_height, img_width, num_class,
+                 map_to_seq_hidden=64, rnn_hidden=256):
+
+        assert img_height % 16 == 0
+        assert img_width % 4 == 0
+
+        super(CRNN, self).__init__()
+        self.cnn = nn.Sequential()
+
+        self.cnn.add_module('conv0', nn.Conv2d(img_channel, 64, 3, 1, 1))
+        self.cnn.add_module('relu0', nn.ReLU(inplace=True))
+        self.cnn.add_module('pooling0', nn.MaxPool2d(kernel_size=2, stride=2))
+
+        self.cnn.add_module('conv1', nn.Conv2d(64, 128, 3, 1, 1))
+        self.cnn.add_module('relu1', nn.ReLU(inplace=True))
+        self.cnn.add_module('pooling1', nn.MaxPool2d(kernel_size=2, stride=2))
+
+        self.cnn.add_module('conv2', nn.Conv2d(128, 256, 3, 1, 1))
+        self.cnn.add_module('relu2', nn.ReLU(inplace=True))
+
+        self.cnn.add_module('conv3', nn.Conv2d(256, 256, 3, 1, 1))
+        self.cnn.add_module('relu3', nn.ReLU(inplace=True))
+        self.cnn.add_module('pooling3', nn.MaxPool2d(kernel_size=(2, 1)))
+
+        self.cnn.add_module('conv4', nn.Conv2d(256, 512, 3, 1, 1))
+        self.cnn.add_module('relu4', nn.ReLU(inplace=True))
+        self.cnn.add_module('batchnorm4', nn.BatchNorm2d(512))
+
+        self.cnn.add_module('conv5', nn.Conv2d(512, 512, 3, 1, 1))
+        self.cnn.add_module('relu5', nn.ReLU(inplace=True))
+        self.cnn.add_module('batchnorm5', nn.BatchNorm2d(512))
+        self.cnn.add_module('pooling5', nn.MaxPool2d(kernel_size=(2, 1)))
+
+        self.cnn.add_module('conv6', nn.Conv2d(512, 512, 2, 1, 0))
+        self.cnn.add_module('relu6', nn.ReLU(inplace=True))
+
+        self.map_to_seq = nn.Linear(512 * (img_height // 16 - 1),
+                                    map_to_seq_hidden)
+
+        self.rnn1 = nn.LSTM(map_to_seq_hidden, rnn_hidden, bidirectional=True)
+        self.rnn2 = nn.LSTM(2 * rnn_hidden, rnn_hidden, bidirectional=True)
+
+        self.dense = nn.Linear(2 * rnn_hidden, num_class)
+
+    def forward(self, images):
+        # shape of images: (batch, channel, height, width)
+
+        conv = self.cnn(images)
+        batch, channel, height, width = conv.size()
+
+        conv = conv.view(batch, channel * height, width)
+        conv = conv.permute(2, 0, 1)  # (width, batch, feature)
+        seq = self.map_to_seq(conv)
+
+        recurrent, _ = self.rnn1(seq)
+        recurrent, _ = self.rnn2(recurrent)
+
+        output = self.dense(recurrent)
+
+        return output  # shape: (seq_len, batch, num_class)

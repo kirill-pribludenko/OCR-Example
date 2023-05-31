@@ -3,31 +3,41 @@ from itertools import groupby
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data as data_utils
 from colorama import Fore
+from torchmetrics import CharErrorRate
 from tqdm import tqdm
 
 from dataset import CapchaDataset
 from model import CRNN
 
 gpu = torch.device("cuda")
-epochs = 5
-
-gru_hidden_size = 128
-gru_num_layers = 2
-cnn_output_height = 4
-cnn_output_width = 32
-digits_per_sequence = 5
-
+epochs = 3
+size_of_one_digit = 32
 model_save_path = "./checkpoints"
+cer = CharErrorRate()
+
+
+def cer_metric(prediction, y_true, blank):
+    prediction = prediction.to(torch.int32)
+    prediction = prediction[prediction != blank].tolist()
+    str_prediction = ''.join(map(str, prediction))
+
+    y_true = y_true.to(torch.int32)
+    y_true = y_true[y_true != train_ds.blank_label].tolist()
+    str_y_true = ''.join(map(str, y_true))
+
+    current_cer = cer(str_prediction, str_y_true).numpy()
+
+    return current_cer
 
 
 def train_one_epoch(model, criterion, optimizer, data_loader) -> None:
     model.train()
-    train_correct = 0
-    train_total = 0
+    train_cer = []
     for x_train, y_train in tqdm(
             data_loader,
             position=0,
@@ -35,12 +45,11 @@ def train_one_epoch(model, criterion, optimizer, data_loader) -> None:
             file=sys.stdout,
             bar_format="{l_bar}%s{bar}%s{r_bar}" % (Fore.GREEN, Fore.RESET),
     ):
-        batch_size = x_train.shape[0]  # x_train.shape == torch.Size([64, 28, 140])
+        batch_size = x_train.shape[0]
         x_train = x_train.view(x_train.shape[0], 1, x_train.shape[1], x_train.shape[2])
         optimizer.zero_grad()
         y_pred = model(x_train.cuda())
-        y_pred = y_pred.permute(1, 0, 2)  # y_pred.shape == torch.Size([64, 32, 11])
-        input_lengths = torch.IntTensor(batch_size).fill_(cnn_output_width)
+        input_lengths = torch.IntTensor(batch_size).fill_(size_of_one_digit)
         target_lengths = torch.IntTensor([len(t) for t in y_train])
         loss = criterion(y_pred, y_train, input_lengths, target_lengths)
         loss.backward()
@@ -55,32 +64,17 @@ def train_one_epoch(model, criterion, optimizer, data_loader) -> None:
             prediction = torch.IntTensor(
                 [c for c, _ in groupby(raw_prediction) if c != train_ds.blank_label]
             )
-            if is_correct(prediction, y_train[i], train_ds.blank_label):
-                train_correct += 1
-            train_total += 1
-    print(
-        "TRAINING. Correct: ",
-        train_correct,
-        "/",
-        train_total,
-        "=",
-        train_correct / train_total,
-    )
 
+            train_cer.append(cer_metric(prediction, y_train[i], train_ds.blank_label))
 
-def is_correct(prediction, y_true, blank):
-    prediction = prediction.to(torch.int32)
-    prediction = prediction[prediction != blank]
-    y_true = y_true.to(torch.int32)
-    y_true = y_true[y_true != blank]
-    return len(prediction) == len(y_true) and torch.all(prediction.eq(y_true))
+    train_mean_cer = round(np.array(train_cer).mean(), 4)
+    print("TRAINING. Mean CER: ", train_mean_cer)
 
 
 def evaluate(model, val_loader) -> float:
     model.eval()
     with torch.no_grad():
-        val_correct = 0
-        val_total = 0
+        val_cer = []
         for x_val, y_val in tqdm(
                 val_loader,
                 position=0,
@@ -91,8 +85,7 @@ def evaluate(model, val_loader) -> float:
             batch_size = x_val.shape[0]
             x_val = x_val.view(x_val.shape[0], 1, x_val.shape[1], x_val.shape[2])
             y_pred = model(x_val.cuda())
-            y_pred = y_pred.permute(1, 0, 2)
-            input_lengths = torch.IntTensor(batch_size).fill_(cnn_output_width)
+            input_lengths = torch.IntTensor(batch_size).fill_(size_of_one_digit)
             target_lengths = torch.IntTensor([len(t) for t in y_val])
             criterion(y_pred, y_val, input_lengths, target_lengths)
             _, max_index = torch.max(y_pred, dim=2)
@@ -101,51 +94,54 @@ def evaluate(model, val_loader) -> float:
                 prediction = torch.IntTensor(
                     [c for c, _ in groupby(raw_prediction) if c != train_ds.blank_label]
                 )
-                if is_correct(prediction, y_val[i], train_ds.blank_label):
-                    val_correct += 1
-                val_total += 1
-        acc = val_correct / val_total
-        print("TESTING. Correct: ", val_correct, "/", val_total, "=", acc)
-    return acc
+                val_cer.append(cer_metric(prediction, y_val[i], train_ds.blank_label))
+
+        val_mean_cer = round(np.array(val_cer).mean(), 4)
+        print("VALIDATION. Mean CER: ", val_mean_cer)
+
+    return val_mean_cer
 
 
 def test_model(model, test_ds, number_of_test_imgs: int = 10):
     model.eval()
-    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=number_of_test_imgs)
+    test_loader = data_utils.DataLoader(test_ds, batch_size=number_of_test_imgs)
     test_preds = []
     (x_test, y_test) = next(iter(test_loader))
     y_pred = model(
         x_test.view(x_test.shape[0], 1, x_test.shape[1], x_test.shape[2]).cuda()
     )
-    y_pred = y_pred.permute(1, 0, 2)
     _, max_index = torch.max(y_pred, dim=2)
     for i in range(x_test.shape[0]):
         raw_prediction = list(max_index[:, i].detach().cpu().numpy())
         prediction = torch.IntTensor(
             [c for c, _ in groupby(raw_prediction) if c != train_ds.blank_label]
         )
-        test_preds.append(prediction)
+        prediction = prediction.to(torch.int32)
+        prediction = prediction[prediction != train_ds.blank_label].tolist()
+        str_prediction = ' '.join(map(str, prediction))
+        test_preds.append(str_prediction)
 
     for j in range(len(x_test)):
         mpl.rcParams["font.size"] = 8
         plt.imshow(x_test[j], cmap="gray")
         mpl.rcParams["font.size"] = 18
-        plt.gcf().text(x=0.1, y=0.1, s="Actual: " + str(y_test[j].numpy()))
-        plt.gcf().text(x=0.1, y=0.2, s="Predicted: " + str(test_preds[j].numpy()))
+        str_y_true = y_test[j].to(torch.int32)
+        str_y_true = str_y_true[str_y_true != train_ds.blank_label].tolist()
+        str_y_true = ' '.join(map(str, str_y_true))
+        plt.gcf().text(x=0.1, y=0.1, s="     Actual: " + str_y_true)
+        plt.gcf().text(x=0.1, y=0.2, s="Predicted: " + test_preds[j])
         plt.savefig(f"./output/plot_{j}.png")
-        # plt.show()
+        plt.clf()
 
 
 if __name__ == "__main__":
     train_ds = CapchaDataset((4, 5))
     test_ds = CapchaDataset((4, 5), samples=100)
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=64)
-    val_loader = torch.utils.data.DataLoader(test_ds, batch_size=1)
+    train_loader = data_utils.DataLoader(train_ds, batch_size=64)
+    val_loader = data_utils.DataLoader(test_ds, batch_size=1)
 
-    model = CRNN(
-        cnn_output_height, gru_hidden_size, gru_num_layers, train_ds.num_classes
-    ).to(gpu)
-    # model.load_state_dict(torch.load("./checkpoints/checkpoint_5.pt"))
+    model = CRNN(1, size_of_one_digit,
+                 size_of_one_digit * 5, train_ds.num_classes).to(gpu)
 
     criterion = nn.CTCLoss(
         blank=train_ds.blank_label, reduction="mean", zero_infinity=True

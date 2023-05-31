@@ -16,7 +16,7 @@ class CapchaDataset(Dataset):
     def __init__(
         self,
         seq_len: Union[int, Tuple[int, int]],
-        img_h: int = 28,
+        img_h: int = 32,
         split: str = "digits",
         samples: int = None,
     ):
@@ -41,8 +41,8 @@ class CapchaDataset(Dataset):
 
     def __len__(self):
         """
-        Можно нагенерировать N различных капчей, где N - число сочетаний с повторениями.
-        Если задано samples - вернуть его
+        Можно нагенерировать N различных капчей, где N - число сочетаний
+        с повторениями. Если задано samples - вернуть его
         """
         if self.samples is not None:
             return self.samples
@@ -51,7 +51,7 @@ class CapchaDataset(Dataset):
     def __preprocess(self, random_images: torch.Tensor) -> np.ndarray:
         transformed_images = []
         for img in random_images:
-            img = transforms.ToPILImage()(img)
+            img = transforms.ToPILImage()(img.type(torch.int))
             img = TF.rotate(img, -90, fill=[0.0])
             img = TF.hflip(img)
             img = transforms.ToTensor()(img).numpy()
@@ -60,15 +60,16 @@ class CapchaDataset(Dataset):
         images = np.hstack(
             images.reshape((len(transformed_images), self.img_h, self.img_h))
         )
-        full_img = np.zeros(shape=(self.img_h, self._max_seq_len * self.img_h)).astype(
-            np.float32
-        )
-        full_img[:, 0 : images.shape[1]] = images
+        full_img = np.zeros(shape=(self.img_h,
+                                   self._max_seq_len * self.img_h)
+                            ).astype(np.float32)
+        full_img[:, 0: images.shape[1]] = images
         return full_img
 
     def __getitem__(self, idx):
         # Get random seq_len
-        random_seq_len = np.random.randint(self._min_seq_len, self._max_seq_len + 1)
+        random_seq_len = np.random.randint(self._min_seq_len,
+                                           self._max_seq_len + 1)
         # Get random ind
         random_indices = np.random.randint(
             len(self.emnist_dataset.data), size=(random_seq_len,)
@@ -77,7 +78,17 @@ class CapchaDataset(Dataset):
         random_digits_labels = self.emnist_dataset.targets[random_indices]
         labels = torch.zeros((1, self._max_seq_len))
         labels = torch.fill(labels, self.blank_label)
-        labels[0, 0 : len(random_digits_labels)] = random_digits_labels
+        labels[0, 0: len(random_digits_labels)] = random_digits_labels
+
+        # Add 2 black pixels on each side
+        size_0 = random_images.size(dim=0)
+        random_images = torch.cat((torch.zeros((size_0, 2, 28)),
+                                   random_images,
+                                   torch.zeros((size_0, 2, 28))), axis=1)
+        random_images = torch.cat((torch.zeros((size_0, 32, 2)),
+                                   random_images,
+                                   torch.zeros((size_0, 32, 2))), axis=2)
+
         x = self.__preprocess(random_images)
         y = labels.numpy().reshape(self._max_seq_len)
         return x, y
